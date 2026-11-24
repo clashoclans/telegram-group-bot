@@ -15,7 +15,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -240,6 +240,76 @@ def record_event(chat_id: int, group_title: str, user_id: int, full_name: str,
         return False
 
 
+def sync_request_status(chat_id: int, user_id: int, new_status: str) -> int:
+    """Update all pending join request records for (chat_id, user_id) to new_status.
+
+    Synchronizes requests.json so that outdated, duplicate, or handled requests
+    do not linger in pending status.
+    Returns the number of updated records.
+    """
+    requests = load_requests()
+    updated_count = 0
+    for rec in requests.values():
+        if (int(rec.get("chat_id", 0)) == chat_id
+                and int(rec.get("user_id", 0)) == user_id
+                and rec.get("status") in ("requested", "payment_pending", "payment_message_sent")):
+            rec["status"] = new_status
+            updated_count += 1
+    if updated_count > 0:
+        try:
+            save_requests(requests)
+            log.info(
+                "Synced %d pending request(s) for user %s in chat %s to status '%s'",
+                updated_count, user_id, chat_id, new_status,
+            )
+        except OSError as exc:
+            log.warning("Could not save requests after status sync: %s", exc)
+    return updated_count
+
+
+async def safe_edit_message_text(
+    query: Any,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+    disable_web_page_preview: bool = False,
+) -> bool:
+    """Safely edit a message, suppressing Telegram's 'Message is not modified' error.
+
+    Returns True if the message was updated, False if it was not modified.
+    """
+    if not query:
+        return False
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+        return True
+    except TelegramError as exc:
+        if "message is not modified" in str(exc).lower():
+            log.debug("Message text and reply markup are unchanged: %s", exc)
+            return False
+        raise
+
+
+async def safe_answer_query(query: Any, text: str | None = None, show_alert: bool = False) -> bool:
+    """Safely answer a callback query, ignoring timeout or duplicate-answer errors."""
+    if not query:
+        return False
+    try:
+        if text:
+            await query.answer(text=text, show_alert=show_alert)
+        else:
+            await query.answer()
+        return True
+    except TelegramError as exc:
+        log.debug("safe_answer_query suppressed error: %s", exc)
+        return False
+
+
 def is_member_status(member: Any) -> bool:
     status = getattr(member, "status", "")
     if status in ("creator", "administrator", "member"):
@@ -352,6 +422,9 @@ def get_help_text() -> str:
         "<b>10. /delmessages</b>\n"
         "• <i>Usage:</i> <code>/delmessages</code> (run inside a group chat).\n"
         "• <i>Use:</i> Deletes all pending in-chat join/leave service messages ('User joined', 'User was accepted', 'User left') from that group.\n\n"
+        "<b>11. /syncrequests</b>\n"
+        "• <i>Usage:</i> <code>/syncrequests</code> in private chat.\n"
+        "• <i>Use:</i> Verifies all pending join requests against Telegram and automatically resolves requests for users who are already members.\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🔘 <b>ADMIN MENU BUTTONS & FEATURES:</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -668,6 +741,8 @@ async def on_service_membership_message(update: Update, context: ContextTypes.DE
             full_name = " ".join(p for p in (user.first_name, user.last_name) if p) or f"User {user.id}"
             if group:
                 record_event(chat.id, group_title, user.id, full_name, user.username, "join")
+            # Synchronize pending join requests so joined user is no longer pending
+            sync_request_status(chat.id, user.id, "approved")
 
             # Notify admins privately with working delete button
             del_kb = InlineKeyboardMarkup([
@@ -697,6 +772,8 @@ async def on_service_membership_message(update: Update, context: ContextTypes.DE
             full_name = " ".join(p for p in (user.first_name, user.last_name) if p) or f"User {user.id}"
             if group:
                 record_event(chat.id, group_title, user.id, full_name, user.username, "leave")
+            # Mark any pending requests for left user as expired
+            sync_request_status(chat.id, user.id, "expired")
 
             del_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🗑 Delete leave message from chat", callback_data=f"delchatmsg:{chat.id}:{message.message_id}")]
@@ -1239,33 +1316,40 @@ async def show_pending_requests(update: Update, context: ContextTypes.DEFAULT_TY
                                 chat_key: str, page: int) -> None:
     """Display paginated pending join requests for a group."""
     query = update.callback_query
-    await query.answer()
+    if query:
+        await safe_answer_query(query)
 
     groups = load_groups()
     group = groups.get(chat_key)
     if not group:
-        await query.edit_message_text(
-            "That group is no longer registered.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Groups", callback_data="list_groups")]]),
-        )
+        msg = "That group is no longer registered."
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Groups", callback_data="list_groups")]])
+        if query:
+            await safe_edit_message_text(query, msg, reply_markup=markup)
+        elif update.effective_message:
+            await update.effective_message.reply_text(msg, reply_markup=markup)
         return
 
     pending = _pending_for_group(chat_key)
     total = len(pending)
 
     if total == 0:
-        await query.edit_message_text(
+        msg = (
             f"📩 Pending requests — {group.get('title', chat_key)}\n\n"
             "No pending join requests recorded for this group.\n\n"
             "• New requests arrive here automatically via the bot's invite link.\n"
             f"• To import requests submitted before the bot joined, use:\n"
             f"  `/addrequest {chat_key} <user_id> [Name]`\n\n"
-            f"Admin Contact: {ADMIN_CONTACT}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data=f"pending:{chat_key}:0")],
-                [InlineKeyboardButton("⬅️ Group settings", callback_data=f"detail:{chat_key}")],
-            ]),
+            f"Admin Contact: {ADMIN_CONTACT}"
         )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data=f"pending:{chat_key}:0")],
+            [InlineKeyboardButton("⬅️ Group settings", callback_data=f"detail:{chat_key}")],
+        ])
+        if query:
+            await safe_edit_message_text(query, msg, reply_markup=markup)
+        elif update.effective_message:
+            await update.effective_message.reply_text(msg, reply_markup=markup)
         return
 
     total_pages = (total + PENDING_PAGE_SIZE - 1) // PENDING_PAGE_SIZE
@@ -1322,10 +1406,12 @@ async def show_pending_requests(update: Update, context: ContextTypes.DEFAULT_TY
     buttons.append([InlineKeyboardButton("⬅️ Group settings", callback_data=f"detail:{chat_key}")])
 
     help_hint = "\n\n👇 Numbered buttons below match the requests above in order:"
-    await query.edit_message_text(
-        f"{header}\n\n{body}{help_hint}\n\nAdmin contact: {ADMIN_CONTACT}",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    text_content = f"{header}\n\n{body}{help_hint}\n\nAdmin contact: {ADMIN_CONTACT}"
+    markup = InlineKeyboardMarkup(buttons)
+    if query:
+        await safe_edit_message_text(query, text_content, reply_markup=markup)
+    elif update.effective_message:
+        await update.effective_message.reply_text(text_content, reply_markup=markup)
 
 
 async def handle_pending_request_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -1334,7 +1420,7 @@ async def handle_pending_request_action(update: Update, context: ContextTypes.DE
     query = update.callback_query
     parts = data.split(":", 2)
     if len(parts) != 3 or parts[1] not in ("approve", "decline", "payment"):
-        await query.answer("Invalid action.", show_alert=True)
+        await safe_answer_query(query, "Invalid action.", show_alert=True)
         return
 
     action = parts[1]
@@ -1343,7 +1429,7 @@ async def handle_pending_request_action(update: Update, context: ContextTypes.DE
     requests = load_requests()
     record = requests.get(token)
     if not record:
-        await query.answer("Request record not found. It may have been removed.", show_alert=True)
+        await safe_answer_query(query, "Request record not found. It may have been removed.", show_alert=True)
         return
 
     chat_id = int(record.get("chat_id", 0))
@@ -1352,12 +1438,16 @@ async def handle_pending_request_action(update: Update, context: ContextTypes.DE
     group = load_groups().get(chat_key, {})
     full_name = record.get("full_name") or "User"
 
-    if record.get("status") in ("approved", "rejected"):
-        await query.answer(
-            f"This request was already {record['status']}. Refreshing list.",
+    if record.get("status") in ("approved", "rejected", "expired"):
+        await safe_answer_query(
+            query,
+            f"This request is no longer active ({record['status']}). Refreshing list.",
             show_alert=True,
         )
-        await show_pending_requests(update, context, chat_key, 0)
+        try:
+            await show_pending_requests(update, context, chat_key, 0)
+        except Exception as exc:
+            log.warning("Could not refresh pending requests view: %s", exc)
         return
 
     try:
@@ -1370,12 +1460,13 @@ async def handle_pending_request_action(update: Update, context: ContextTypes.DE
             )
             try:
                 await context.bot.send_message(chat_id=user_id, text=message)
-                await query.answer(f"Payment message sent to {full_name}.")
+                await safe_answer_query(query, f"Payment message sent to {full_name}.")
             except TelegramError:
                 bot = await context.bot.get_me()
                 start_link = f"https://t.me/{bot.username}?start=pay_{token}"
-                await query.answer(
-                    f"Payment status saved. User hasn't opened bot yet. Share link with them.",
+                await safe_answer_query(
+                    query,
+                    "Payment status saved. User hasn't opened bot yet. Share link with them.",
                     show_alert=True,
                 )
                 for admin_id in ADMIN_IDS:
@@ -1395,34 +1486,42 @@ async def handle_pending_request_action(update: Update, context: ContextTypes.DE
                         pass
         elif action == "approve":
             await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
-            record["status"] = "approved"
-            save_requests(requests)
-            # Join event will be recorded automatically by member_update / on_service_membership_message
-            await query.answer(f"Approved {full_name}.")
+            sync_request_status(chat_id, user_id, "approved")
+            await safe_answer_query(query, f"Approved {full_name}.")
         elif action == "decline":
             await context.bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
-            record["status"] = "rejected"
-            save_requests(requests)
-            await query.answer(f"Rejected {full_name}.")
-
-        await show_pending_requests(update, context, chat_key, 0)
+            sync_request_status(chat_id, user_id, "rejected")
+            await safe_answer_query(query, f"Rejected {full_name}.")
 
     except TelegramError as exc:
         log.warning("Pending request action %s failed for token %s: %s", action, token, exc)
         err_msg = str(exc)
-        if "HIDE_REQUESTER_MISSING" in err_msg or "USER_ALREADY_PARTICIPANT" in err_msg:
-            record["status"] = "approved" if action == "approve" else "expired"
-            save_requests(requests)
-            await query.answer(
-                "The join request no longer exists at Telegram (user may already be a member or withdrew).",
+        err_upper = err_msg.upper()
+        if "USER_ALREADY_PARTICIPANT" in err_upper:
+            sync_request_status(chat_id, user_id, "approved")
+            await safe_answer_query(
+                query,
+                f"{full_name} is already a member of this group. Request marked as approved.",
+                show_alert=True,
+            )
+        elif "HIDE_REQUESTER_MISSING" in err_upper:
+            final_status = "approved" if action == "approve" else "expired"
+            sync_request_status(chat_id, user_id, final_status)
+            await safe_answer_query(
+                query,
+                "The join request no longer exists on Telegram (user may have withdrawn or request was already handled).",
                 show_alert=True,
             )
         else:
-            await query.answer(f"Failed: {err_msg[:180]}", show_alert=True)
-        await show_pending_requests(update, context, chat_key, 0)
+            await safe_answer_query(query, f"Failed: {err_msg[:180]}", show_alert=True)
     except OSError as exc:
         log.warning("Storage error processing pending request %s: %s", token, exc)
-        await query.answer("Storage error. Check disk.", show_alert=True)
+        await safe_answer_query(query, "Storage error. Check disk.", show_alert=True)
+
+    try:
+        await show_pending_requests(update, context, chat_key, 0)
+    except Exception as exc:
+        log.warning("Could not refresh pending requests view: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1444,22 +1543,27 @@ async def show_all_pending_requests(update: Update, context: ContextTypes.DEFAUL
                                     page: int) -> None:
     """Display paginated pending join requests across ALL groups."""
     query = update.callback_query
-    await query.answer()
+    if query:
+        await safe_answer_query(query)
 
     pending = _all_pending()
     total = len(pending)
 
     if total == 0:
-        await query.edit_message_text(
+        msg = (
             "📩 All Pending Requests\n\n"
             "No pending join requests across any group.\n\n"
             "New requests arrive here automatically when users click the invite link.\n\n"
-            f"Admin Contact: {ADMIN_CONTACT}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data="all_pending:0")],
-                [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
-            ]),
+            f"Admin Contact: {ADMIN_CONTACT}"
         )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="all_pending:0")],
+            [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
+        ])
+        if query:
+            await safe_edit_message_text(query, msg, reply_markup=markup)
+        elif update.effective_message:
+            await update.effective_message.reply_text(msg, reply_markup=markup)
         return
 
     total_pages = (total + PENDING_PAGE_SIZE - 1) // PENDING_PAGE_SIZE
@@ -1521,10 +1625,12 @@ async def show_all_pending_requests(update: Update, context: ContextTypes.DEFAUL
     buttons.append([InlineKeyboardButton("⬅️ Menu", callback_data="menu")])
 
     help_hint = "\n\n👇 Numbered buttons below match the requests above in order:"
-    await query.edit_message_text(
-        f"{header}\n\n{body}{help_hint}\n\nAdmin contact: {ADMIN_CONTACT}",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    text_content = f"{header}\n\n{body}{help_hint}\n\nAdmin contact: {ADMIN_CONTACT}"
+    markup = InlineKeyboardMarkup(buttons)
+    if query:
+        await safe_edit_message_text(query, text_content, reply_markup=markup)
+    elif update.effective_message:
+        await update.effective_message.reply_text(text_content, reply_markup=markup)
 
 
 async def handle_all_pending_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -1533,7 +1639,7 @@ async def handle_all_pending_action(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     parts = data.split(":", 3)
     if len(parts) != 4 or parts[1] not in ("approve", "decline", "payment"):
-        await query.answer("Invalid action.", show_alert=True)
+        await safe_answer_query(query, "Invalid action.", show_alert=True)
         return
 
     action = parts[1]
@@ -1546,7 +1652,7 @@ async def handle_all_pending_action(update: Update, context: ContextTypes.DEFAUL
     requests = load_requests()
     record = requests.get(token)
     if not record:
-        await query.answer("Request record not found. It may have been removed.", show_alert=True)
+        await safe_answer_query(query, "Request record not found. It may have been removed.", show_alert=True)
         return
 
     chat_id = int(record.get("chat_id", 0))
@@ -1555,12 +1661,16 @@ async def handle_all_pending_action(update: Update, context: ContextTypes.DEFAUL
     group = load_groups().get(chat_key, {})
     full_name = record.get("full_name") or "User"
 
-    if record.get("status") in ("approved", "rejected"):
-        await query.answer(
-            f"This request was already {record['status']}. Refreshing list.",
+    if record.get("status") in ("approved", "rejected", "expired"):
+        await safe_answer_query(
+            query,
+            f"This request is no longer active ({record['status']}). Refreshing list.",
             show_alert=True,
         )
-        await show_all_pending_requests(update, context, return_page)
+        try:
+            await show_all_pending_requests(update, context, return_page)
+        except Exception as exc:
+            log.warning("Could not refresh all-pending view: %s", exc)
         return
 
     try:
@@ -1573,12 +1683,13 @@ async def handle_all_pending_action(update: Update, context: ContextTypes.DEFAUL
             )
             try:
                 await context.bot.send_message(chat_id=user_id, text=message)
-                await query.answer(f"Payment message sent to {full_name}.")
+                await safe_answer_query(query, f"Payment message sent to {full_name}.")
             except TelegramError:
                 bot = await context.bot.get_me()
                 start_link = f"https://t.me/{bot.username}?start=pay_{token}"
-                await query.answer(
-                    f"Payment status saved. User hasn't opened bot yet. Share link with them.",
+                await safe_answer_query(
+                    query,
+                    "Payment status saved. User hasn't opened bot yet. Share link with them.",
                     show_alert=True,
                 )
                 for admin_id in ADMIN_IDS:
@@ -1598,33 +1709,42 @@ async def handle_all_pending_action(update: Update, context: ContextTypes.DEFAUL
                         pass
         elif action == "approve":
             await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
-            record["status"] = "approved"
-            save_requests(requests)
-            await query.answer(f"Approved {full_name}.")
+            sync_request_status(chat_id, user_id, "approved")
+            await safe_answer_query(query, f"Approved {full_name}.")
         elif action == "decline":
             await context.bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
-            record["status"] = "rejected"
-            save_requests(requests)
-            await query.answer(f"Rejected {full_name}.")
-
-        await show_all_pending_requests(update, context, return_page)
+            sync_request_status(chat_id, user_id, "rejected")
+            await safe_answer_query(query, f"Rejected {full_name}.")
 
     except TelegramError as exc:
         log.warning("All-pending action %s failed for token %s: %s", action, token, exc)
         err_msg = str(exc)
-        if "HIDE_REQUESTER_MISSING" in err_msg or "USER_ALREADY_PARTICIPANT" in err_msg:
-            record["status"] = "approved" if action == "approve" else "expired"
-            save_requests(requests)
-            await query.answer(
-                "The join request no longer exists at Telegram (user may already be a member or withdrew).",
+        err_upper = err_msg.upper()
+        if "USER_ALREADY_PARTICIPANT" in err_upper:
+            sync_request_status(chat_id, user_id, "approved")
+            await safe_answer_query(
+                query,
+                f"{full_name} is already a member of this group. Request marked as approved.",
+                show_alert=True,
+            )
+        elif "HIDE_REQUESTER_MISSING" in err_upper:
+            final_status = "approved" if action == "approve" else "expired"
+            sync_request_status(chat_id, user_id, final_status)
+            await safe_answer_query(
+                query,
+                "The join request no longer exists on Telegram (user may have withdrawn or request was already handled).",
                 show_alert=True,
             )
         else:
-            await query.answer(f"Failed: {err_msg[:180]}", show_alert=True)
-        await show_all_pending_requests(update, context, return_page)
+            await safe_answer_query(query, f"Failed: {err_msg[:180]}", show_alert=True)
     except OSError as exc:
         log.warning("Storage error processing pending request %s: %s", token, exc)
-        await query.answer("Storage error. Check disk.", show_alert=True)
+        await safe_answer_query(query, "Storage error. Check disk.", show_alert=True)
+
+    try:
+        await show_all_pending_requests(update, context, return_page)
+    except Exception as exc:
+        log.warning("Could not refresh all-pending view: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1686,10 +1806,11 @@ async def show_group_history_menu(update: Update, chat_key: str) -> None:
 
 async def show_recent_joins(update: Update, chat_key: str) -> None:
     query = update.callback_query
-    await query.answer()
+    await safe_answer_query(query)
     group = load_groups().get(chat_key)
     if not group:
-        await query.edit_message_text(
+        await safe_edit_message_text(
+            query,
             "That group is no longer registered.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Groups", callback_data="history_groups")]]),
         )
@@ -1720,7 +1841,8 @@ async def show_recent_joins(update: Update, chat_key: str) -> None:
             when = event.get("timestamp", "unknown time").replace("T", " ").replace("+00:00", " UTC")
             lines.append(f"{index}. {name}{username}\n   User ID: {event.get('user_id', '?')}\n   Joined: {when}")
         body = "\n\n".join(lines)
-    await query.edit_message_text(
+    await safe_edit_message_text(
+        query,
         f"👥 Last {len(joins)} unique joiner(s) — {group.get('title', chat_key)}\n\n{body}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Refresh", callback_data=f"recent:{chat_key}")],
@@ -1731,10 +1853,11 @@ async def show_recent_joins(update: Update, chat_key: str) -> None:
 
 async def show_recent_events(update: Update, chat_key: str) -> None:
     query = update.callback_query
-    await query.answer()
+    await safe_answer_query(query)
     group = load_groups().get(chat_key)
     if not group:
-        await query.edit_message_text(
+        await safe_edit_message_text(
+            query,
             "That group is no longer registered.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Groups", callback_data="history_groups")]]),
         )
@@ -1758,7 +1881,8 @@ async def show_recent_events(update: Update, chat_key: str) -> None:
     pending_msgs = len(service_msgs.get(str(chat_key), []))
     del_btn_label = f"🗑 Delete messages from chat ({pending_msgs})" if pending_msgs else "🗑 Delete messages from chat"
 
-    await query.edit_message_text(
+    await safe_edit_message_text(
+        query,
         f"📜 Recent entry/exit logs — {group.get('title', chat_key)}\n\n{body}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Refresh", callback_data=f"events:{chat_key}")],
@@ -1797,6 +1921,10 @@ async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     full_name = " ".join(p for p in (user.first_name, user.last_name) if p) or f"User {user.id}"
     group_title = group.get("title", change.chat.title or str(chat_id))
     record_event(chat_id, group_title, user.id, full_name, user.username, event_type)
+    if now_member:
+        sync_request_status(chat_id, user.id, "approved")
+    else:
+        sync_request_status(chat_id, user.id, "expired")
 
 
 # ---------------------------------------------------------------------------
@@ -1985,7 +2113,7 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, da
     query = update.callback_query
     parts = data.split(":")
     if len(parts) != 4 or parts[1] not in ("approve", "decline", "payment"):
-        await query.answer("Invalid request.", show_alert=True)
+        await safe_answer_query(query, "Invalid request.", show_alert=True)
         return
     action, chat_id_text, user_id_text = parts[1], parts[2], parts[3]
     record: dict[str, Any] | None = None
@@ -1999,18 +2127,19 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, da
         ), None)
         record = requests.get(token) if token else None
 
-        if record and record.get("status") in ("approved", "rejected"):
-            await query.answer(
+        if record and record.get("status") in ("approved", "rejected", "expired"):
+            await safe_answer_query(
+                query,
                 f"This request was already {record['status']}.",
                 show_alert=True,
             )
             old = query.message.text or "Join request"
-            await query.edit_message_text(f"{old}\n\nℹ️ Already {record['status']}.")
+            await safe_edit_message_text(query, f"{old}\n\nℹ️ Already {record['status']}.")
             return
 
         if action == "payment":
             if not record:
-                await query.answer("Request record not found.", show_alert=True)
+                await safe_answer_query(query, "Request record not found.", show_alert=True)
                 return
             record["status"] = "payment_pending"
             save_requests(requests)
@@ -2021,9 +2150,9 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, da
             try:
                 await context.bot.send_message(chat_id=user_id, text=message)
                 result = "Payment pending: message sent directly to applicant."
-                await query.answer("Payment message sent.")
+                await safe_answer_query(query, "Payment message sent.")
                 old = query.message.text or "Join request"
-                await query.edit_message_text(f"{old}\n\n💳 {result}\nAdmin contact: {ADMIN_CONTACT}")
+                await safe_edit_message_text(query, f"{old}\n\n💳 {result}\nAdmin contact: {ADMIN_CONTACT}")
             except TelegramError:
                 bot = await context.bot.get_me()
                 start_link = f"https://t.me/{bot.username}?start=pay_{token}"
@@ -2033,9 +2162,10 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, da
                     f"{start_link}\n\n"
                     f"Admin contact: {ADMIN_CONTACT}"
                 )
-                await query.answer("Payment status saved; share the link with applicant.", show_alert=True)
+                await safe_answer_query(query, "Payment status saved; share the link with applicant.", show_alert=True)
                 old = query.message.text or "Join request"
-                await query.edit_message_text(
+                await safe_edit_message_text(
+                    query,
                     f"{old}\n\n💳 Payment Pending\n{result}",
                     disable_web_page_preview=True,
                 )
@@ -2044,40 +2174,42 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, da
         if action == "approve":
             await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
             result = "Request approved."
-            status = "approved"
-            if record:
-                record["status"] = status
-                save_requests(requests)
-            # Join event will be recorded automatically by member_update / on_service_membership_message
+            sync_request_status(chat_id, user_id, "approved")
         else:
             await context.bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
             result = "Request rejected."
-            status = "rejected"
-            if record:
-                record["status"] = status
-                save_requests(requests)
+            sync_request_status(chat_id, user_id, "rejected")
 
-        await query.answer(result)
+        await safe_answer_query(query, result)
         old = query.message.text or "Join request"
-        await query.edit_message_text(f"{old}\n\n✅ {result}")
+        await safe_edit_message_text(query, f"{old}\n\n✅ {result}")
     except TelegramError as exc:
         log.warning("Could not process join request: %s", exc)
         err_msg = str(exc)
-        if "HIDE_REQUESTER_MISSING" in err_msg or "USER_ALREADY_PARTICIPANT" in err_msg:
-            if record:
-                record["status"] = "expired"
-                save_requests(requests)
-            await query.answer(
+        err_upper = err_msg.upper()
+        old = query.message.text or "Join request"
+        if "USER_ALREADY_PARTICIPANT" in err_upper:
+            sync_request_status(chat_id, user_id, "approved")
+            await safe_answer_query(
+                query,
+                "User is already a member of this group. Request marked as approved.",
+                show_alert=True,
+            )
+            await safe_edit_message_text(query, f"{old}\n\nℹ️ User is already a participant.")
+        elif "HIDE_REQUESTER_MISSING" in err_upper:
+            final_status = "approved" if action == "approve" else "expired"
+            sync_request_status(chat_id, user_id, final_status)
+            await safe_answer_query(
+                query,
                 "The join request no longer exists (user may have withdrawn or already joined).",
                 show_alert=True,
             )
-            old = query.message.text or "Join request"
-            await query.edit_message_text(f"{old}\n\nℹ️ Request expired or already handled.")
+            await safe_edit_message_text(query, f"{old}\n\nℹ️ Request expired or already handled.")
         else:
-            await query.answer(f"Could not process: {err_msg[:180]}", show_alert=True)
+            await safe_answer_query(query, f"Could not process: {err_msg[:180]}", show_alert=True)
     except (OSError, ValueError) as exc:
         log.warning("Could not process join request: %s", exc)
-        await query.answer("Could not process request. Check storage.", show_alert=True)
+        await safe_answer_query(query, "Could not process request. Check storage.", show_alert=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2197,6 +2329,88 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+#  Synchronization & Error Handling
+# ---------------------------------------------------------------------------
+
+async def syncrequests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check all pending join requests against Telegram and synchronize status."""
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    requests = load_requests()
+    pending = [
+        (tok, rec) for tok, rec in requests.items()
+        if rec.get("status") in ("requested", "payment_pending", "payment_message_sent")
+    ]
+    if not pending:
+        if update.effective_message:
+            await update.effective_message.reply_text("✅ No pending requests to synchronize.")
+        return
+
+    status_msg = None
+    if update.effective_message:
+        status_msg = await update.effective_message.reply_text(
+            f"🔄 Synchronizing {len(pending)} pending request(s) with Telegram..."
+        )
+
+    updated_count = 0
+    approved_count = 0
+
+    for tok, rec in pending:
+        chat_id = int(rec.get("chat_id", 0))
+        user_id = int(rec.get("user_id", 0))
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+            if is_member_status(member):
+                rec["status"] = "approved"
+                updated_count += 1
+                approved_count += 1
+        except TelegramError as exc:
+            err_upper = str(exc).upper()
+            if "USER_NOT_PARTICIPANT" in err_upper:
+                pass
+            elif "CHAT_NOT_FOUND" in err_upper or "CHAT_ADMIN_REQUIRED" in err_upper:
+                pass
+
+    if updated_count > 0:
+        save_requests(requests)
+
+    report = (
+        f"✅ <b>Synchronization Complete</b>\n\n"
+        f"Total pending checked: {len(pending)}\n"
+        f"Already joined (marked approved): {approved_count}\n"
+        f"Remaining pending: {len(pending) - updated_count}"
+    )
+    if status_msg:
+        try:
+            await status_msg.edit_text(report, parse_mode="HTML")
+        except TelegramError:
+            pass
+    elif update.effective_message:
+        await update.effective_message.reply_text(report, parse_mode="HTML")
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Centralized error handler for the Telegram Application."""
+    err = context.error
+    if isinstance(err, TelegramError) and "message is not modified" in str(err).lower():
+        log.debug("Ignored 'Message is not modified' in global error handler.")
+        return
+
+    log.error("Unhandled exception while processing update: %s", err, exc_info=err)
+
+    if isinstance(update, Update):
+        if update.callback_query:
+            await safe_answer_query(update.callback_query, "⚠️ An error occurred. Please try again.", show_alert=True)
+        elif update.effective_message and update.effective_chat and update.effective_chat.type == ChatType.PRIVATE:
+            try:
+                await update.effective_message.reply_text("⚠️ An error occurred while processing your request.")
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 #  Application entry point
 # ---------------------------------------------------------------------------
 
@@ -2219,6 +2433,7 @@ def main() -> None:
     log.info("Service messages file: %s", SERVICE_MESSAGES_FILE)
 
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(global_error_handler)
 
     # Schedule nightly backup at 9:00 PM IST (UTC+5:30 = 15:30 UTC)
     IST = timezone(timedelta(hours=5, minutes=30))
@@ -2241,6 +2456,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addlog", addlog))
     app.add_handler(CommandHandler("del", del_command))
     app.add_handler(CommandHandler("delmessages", delmessages_command))
+    app.add_handler(CommandHandler("syncrequests", syncrequests_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(ChatJoinRequestHandler(join_request))

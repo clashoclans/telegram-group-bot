@@ -43,7 +43,11 @@ An admin-only Telegram bot for managing approximately 30 Telegram groups. It inc
     - `/addlog <chat_id> <user_id> <join|leave> [Name]`: Backfill historical membership events.
     - `/del`: Reply `/del` to any message in a group to delete it immediately.
     - `/delmessages`: Delete all pending entry/exit service messages in the group.
+    - `/syncrequests`: Synchronize all pending join requests with Telegram (auto-resolves requests for users already in groups).
 - **Security & Reliability**:
+  - Centralized global error handler capturing all unhandled exceptions cleanly.
+  - Safe UI edits suppressing Telegram's `Message is not modified` error on duplicate button clicks.
+  - Live join/leave synchronization maintaining consistency between Telegram and `requests.json`.
   - Admin authorization strictly enforced by Telegram numeric user ID.
   - Atomic JSON writes via temporary files to avoid data corruption or partial writes.
   - Safe error handling for missing files, invalid JSON, and Telegram API errors.
